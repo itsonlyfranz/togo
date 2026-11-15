@@ -136,10 +136,20 @@ func checkArg(what, v string, id bool) error {
 // run execs herdr with args and "--session NAME", returning stdout. A
 // failure carries Herdr's JSON error as an *APIError when there is one.
 func (c *Client) run(ctx context.Context, args ...string) (string, error) {
+	return c.runPassing(ctx, args, nil)
+}
+
+// runPassing is run with pass appended after "--", for a command that hands
+// those arguments to another program. --session goes before the "--" so it
+// stays a Herdr option.
+func (c *Client) runPassing(ctx context.Context, args, pass []string) (string, error) {
 	if c.Session == "" || strings.HasPrefix(c.Session, "-") {
 		return "", fmt.Errorf("herdr: invalid session name %q", c.Session)
 	}
 	full := append(append([]string{}, args...), "--session", c.Session)
+	if pass != nil {
+		full = append(append(full, "--"), pass...)
+	}
 	cmd := exec.CommandContext(ctx, c.Bin, full...)
 	cmd.Env = scrubEnv(os.Environ())
 	var out, errBuf strings.Builder
