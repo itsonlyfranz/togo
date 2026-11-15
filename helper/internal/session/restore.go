@@ -10,7 +10,6 @@ import (
 
 	"github.com/gettogo/togo/helper/internal/agents"
 	"github.com/gettogo/togo/helper/internal/fsx"
-	"github.com/gettogo/togo/helper/internal/tmux"
 	"github.com/gettogo/togo/helper/internal/wire"
 )
 
@@ -47,7 +46,7 @@ func (s *Service) Restorable(ctx context.Context) ([]wire.RestorableSession, err
 	if s.Manifest == nil {
 		return nil, nil
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return nil, err
 	}
 	verdicts, err := s.judge(ctx)
@@ -81,7 +80,7 @@ func (s *Service) Restore(ctx context.Context, id string, resume bool) (Session,
 	if err := requireManaged(id); err != nil {
 		return Session{}, err
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return Session{}, err
 	}
 	if s.Manifest == nil {
@@ -105,13 +104,9 @@ func (s *Service) Restore(ctx context.Context, id string, resume bool) (Session,
 		if launch, err = s.restoreCommand(ctx, e, resume); err != nil {
 			return err
 		}
-		infos, err := s.Tmux.ListSessions(ctx)
+		used, err := s.usedBibs(ctx)
 		if err != nil {
 			return err
-		}
-		used := make(map[string]bool, len(infos))
-		for _, info := range infos {
-			used[info.Bib] = true
 		}
 		if bib = e.Bib; used[bib] {
 			if bib, err = lowestFreeBib(used); err != nil {
@@ -128,11 +123,11 @@ func (s *Service) Restore(ctx context.Context, id string, resume bool) (Session,
 			}
 		}
 		run := launch.WithEndpoint(e.Agent, id, dir)
-		err = s.Tmux.NewSession(ctx, tmux.NewSessionOpts{
-			Name: id, Dir: dir, Cols: defaultCols, Rows: defaultRows,
-			Command: launchWrapper(s.shell(), s.TogoPath, run),
-			Options: options,
-			Env:     withEnv(s.sessionEnv(id, bib, e.Agent), run.Env),
+		err = s.backend().Start(ctx, StartSpec{
+			ID: id, Dir: dir, Cols: defaultCols, Rows: defaultRows,
+			Run:    Run{Agent: e.Agent, Launch: run},
+			Values: options,
+			Env:    withEnv(s.sessionEnv(id, bib, e.Agent), run.Env),
 		})
 		if err != nil {
 			return err
@@ -151,7 +146,7 @@ func (s *Service) Dismiss(ctx context.Context, id string) error {
 	if err := requireManaged(id); err != nil {
 		return err
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return err
 	}
 	if s.Manifest == nil {
@@ -235,7 +230,7 @@ func (s *Service) Settle(ctx context.Context) error {
 	if s.Manifest == nil {
 		return nil
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return err
 	}
 	_, err := s.judge(ctx)
@@ -255,17 +250,20 @@ func (s *Service) judge(ctx context.Context) ([]judged, error) {
 	if len(entries) == 0 {
 		return nil, nil
 	}
-	infos, err := s.Tmux.ListSessions(ctx)
+	b := s.backend()
+	recs, err := b.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
-	started, serverUp, err := s.Tmux.ServerStarted(ctx)
+	// A server whose start time is not known reads as older than every
+	// session, so a session missing under it was ended at the desk.
+	started, serverUp, err := b.ServerStarted(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("tmux server: %w", err)
+		return nil, fmt.Errorf("session server: %w", err)
 	}
-	live := make(map[string]bool, len(infos))
-	for _, info := range infos {
-		live[info.Name] = true
+	live := make(map[string]bool, len(recs))
+	for _, r := range recs {
+		live[r.ID] = true
 	}
 	now := s.now().UTC().Truncate(time.Second)
 	out := make([]judged, 0, len(entries))

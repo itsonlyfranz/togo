@@ -28,11 +28,11 @@ func (s *Service) SaveExit(ctx context.Context, id string, e *SavedExit) error {
 	}
 	var err error
 	if e == nil {
-		err = s.Tmux.UnsetOption(ctx, id, optionExit)
+		err = s.backend().UnsetValue(ctx, id, optionExit)
 	} else {
 		var b []byte
 		if b, err = json.Marshal(e); err == nil {
-			err = s.Tmux.SetOption(ctx, id, optionExit, string(b))
+			err = s.backend().SetValue(ctx, id, optionExit, string(b))
 		}
 	}
 	if err != nil {
@@ -74,13 +74,13 @@ func decodeExit(v string) (*SavedExit, error) {
 }
 
 // AgentGone reports whether the session's pane shows no agent running
-// (see the AgentGone function). A missing session is ErrNotFound.
+// (for tmux, see the AgentGone function). A missing session is ErrNotFound.
 func (s *Service) AgentGone(ctx context.Context, id string) (bool, error) {
-	fg, err := s.Tmux.Foreground(ctx, id)
+	gone, err := s.backend().AgentGone(ctx, id)
 	if err != nil {
 		return false, notFoundOr(err, id)
 	}
-	return AgentGone(fg, s.TogoPath), nil
+	return gone, nil
 }
 
 // AgentGone reports whether fg shows no agent running: the pane is dead,
