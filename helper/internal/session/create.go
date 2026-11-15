@@ -11,7 +11,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/gettogo/togo/helper/internal/fsx"
-	"github.com/gettogo/togo/helper/internal/tmux"
 )
 
 const (
@@ -74,7 +73,7 @@ func (s *Service) Create(ctx context.Context, o CreateOpts) (Session, error) {
 	if name == "" {
 		name = a.Name
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return Session{}, err
 	}
 
@@ -106,14 +105,14 @@ func (s *Service) Create(ctx context.Context, o CreateOpts) (Session, error) {
 		id = s.newID()
 		options[optionBib] = bib
 		run := launch.WithEndpoint(a.ID, id, dir)
-		err = s.Tmux.NewSession(ctx, tmux.NewSessionOpts{
-			Name:    id,
-			Dir:     dir,
-			Cols:    cols,
-			Rows:    rows,
-			Command: launchWrapper(s.shell(), s.TogoPath, run),
-			Options: options,
-			Env:     withEnv(s.sessionEnv(id, bib, a.ID), run.Env),
+		err = s.backend().Start(ctx, StartSpec{
+			ID:     id,
+			Dir:    dir,
+			Cols:   cols,
+			Rows:   rows,
+			Run:    Run{Agent: a.ID, Launch: run},
+			Values: options,
+			Env:    withEnv(s.sessionEnv(id, bib, a.ID), run.Env),
 		})
 		if err == nil {
 			s.remember(ManifestEntry{ID: id, Bib: bib, Name: name, Agent: a.ID, Cwd: dir, Command: launch.Argv(), CreatedAt: created, Muted: o.Muted})
@@ -126,8 +125,8 @@ func (s *Service) Create(ctx context.Context, o CreateOpts) (Session, error) {
 	return s.started(ctx, id, bib, name, a.ID, dir, created, launch.Argv())
 }
 
-// started returns a session just started in tmux as List would. When the
-// pane's process already exited and tmux destroyed the session, the caller
+// started returns a session just started as List would. When the pane's
+// process already exited and the backend destroyed the session, the caller
 // still gets the session it started, as exited.
 func (s *Service) started(ctx context.Context, id, bib, name, agent, dir string, created time.Time, argv []string) (Session, error) {
 	sess, err := s.find(ctx, id)
@@ -152,15 +151,24 @@ func (s *Service) started(ctx context.Context, id, bib, name, agent, dir string,
 }
 
 func (s *Service) nextBib(ctx context.Context) (string, error) {
-	infos, err := s.Tmux.ListSessions(ctx)
+	used, err := s.usedBibs(ctx)
 	if err != nil {
 		return "", err
 	}
-	used := make(map[string]bool, len(infos))
-	for _, info := range infos {
-		used[info.Bib] = true
-	}
 	return lowestFreeBib(used)
+}
+
+// usedBibs returns the bibs of every session on the backend.
+func (s *Service) usedBibs(ctx context.Context) (map[string]bool, error) {
+	recs, err := s.backend().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	used := make(map[string]bool, len(recs))
+	for _, r := range recs {
+		used[r.Values[optionBib]] = true
+	}
+	return used, nil
 }
 
 // normalizeName trims Unicode whitespace and checks the result is at most 64

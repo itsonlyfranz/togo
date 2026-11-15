@@ -51,8 +51,8 @@ func (s *Service) Relaunch(ctx context.Context, id string) (Session, error) {
 	if err := s.setRunEnv(ctx, id, launch.Env); err != nil {
 		return Session{}, notFoundOr(err, id)
 	}
-	if err := s.Tmux.RespawnPane(ctx, "="+id+":", dir, launchWrapper(s.shell(), s.TogoPath, launch)); err != nil {
-		return Session{}, notFoundOr(err, id)
+	if err := s.respawn(ctx, id, dir, sess.Agent, launch); err != nil {
+		return Session{}, err
 	}
 	sess, err = s.find(ctx, id)
 	if err == nil {
@@ -101,10 +101,17 @@ func (s *Service) RelaunchWith(ctx context.Context, id string, argv []string) er
 	if err := s.setRunEnv(ctx, id, launch.Env); err != nil {
 		return notFoundOr(err, id)
 	}
-	if err := s.Tmux.RespawnPane(ctx, "="+id+":", dir, launchWrapper(s.shell(), s.TogoPath, launch)); err != nil {
+	return s.respawn(ctx, id, dir, sess.Agent, launch)
+}
+
+// respawn runs launch in the session's pane. ErrRunning passes through:
+// a backend that cannot stop a running agent reports it.
+func (s *Service) respawn(ctx context.Context, id, dir, agent string, launch Launch) error {
+	err := s.backend().Respawn(ctx, id, dir, Run{Agent: agent, Launch: launch})
+	if err != nil && !errors.Is(err, ErrRunning) {
 		return notFoundOr(err, id)
 	}
-	return nil
+	return err
 }
 
 // relaunchCommand returns the validated Launch for sess.
@@ -150,7 +157,7 @@ func storedProgramMatches(agent, stored, resolved string) bool {
 // into the session's environment, which a respawned pane starts with.
 func (s *Service) setRunEnv(ctx context.Context, id string, env map[string]string) error {
 	for _, k := range slices.Sorted(maps.Keys(env)) {
-		if err := s.Tmux.SetEnvironment(ctx, id, k, env[k]); err != nil {
+		if err := s.backend().SetEnv(ctx, id, k, env[k]); err != nil {
 			return err
 		}
 	}

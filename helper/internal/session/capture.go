@@ -34,11 +34,12 @@ func (s *Service) Capture(ctx context.Context, id string, lines int, join bool) 
 	if err != nil {
 		return "", false, err
 	}
-	client, name := s.Tmux, sess.ID
-	if !sess.Managed {
-		client, name = s.User, sess.Name
+	var raw string
+	if sess.Managed {
+		raw, err = s.backend().Capture(ctx, sess.ID, lines, join)
+	} else {
+		raw, err = s.User.CaptureHistory(ctx, sess.Name, lines, join)
 	}
-	raw, err := client.CaptureHistory(ctx, name, lines, join)
 	if err != nil {
 		return "", false, notFoundOr(err, id)
 	}

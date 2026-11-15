@@ -1,6 +1,7 @@
 // Package session is the helper's domain layer for terminal sessions: it
-// creates, lists, renames and kills managed tmux sessions on the togo socket
-// and shows the user's own tmux sessions read-only.
+// creates, lists, renames and kills managed sessions, which run on a
+// Backend (tmux on the togo socket unless one is set), and shows the user's
+// own tmux sessions read-only.
 package session
 
 import (
@@ -8,10 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gettogo/togo/helper/internal/agents"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -101,8 +98,11 @@ type Session struct {
 // Service runs session operations. Construct it with NewService, or set the
 // fields directly in tests. A Service must not be copied after first use.
 type Service struct {
-	// Tmux is the client for the togo socket, where managed sessions live.
+	// Tmux is the client for the togo socket, where managed sessions live
+	// unless Backend is set.
 	Tmux *tmux.Client
+	// Backend runs managed sessions; nil means tmux on Tmux.
+	Backend Backend
 	// User is the client for the user's default socket, listed read-only.
 	// Nil disables unmanaged sessions.
 	User *tmux.Client
@@ -131,72 +131,15 @@ type Service struct {
 	NewID func() string
 	Now   func() time.Time
 
-	mu          sync.Mutex
-	tmuxChecked bool
-	tmuxErr     error
-}
-
-// TmuxFallbacks are where package managers and systems install tmux, for
-// when the login PATH does not name it either. home is the user's home
-// directory; when empty, the per-user folders are left out.
-func TmuxFallbacks(home string) []string {
-	dirs := append(agents.FallbackDirs(home), "/usr/bin", "/bin")
-	list := make([]string, len(dirs))
-	for i, d := range dirs {
-		list[i] = filepath.Join(d, "tmux")
-	}
-	return list
-}
-
-// NewService returns the production Service rooted at home (see
-// state.Home). It rewrites home/tmux.conf on every start so the file always
-// matches this helper version. The togo socket label comes from
-// TOGO_TMUX_LABEL when set, which only tests do. It does not run tmux, so a
-// missing tmux surfaces on the first session call, not here.
-func NewService(ctx context.Context, home string) (*Service, error) {
-	conf := filepath.Join(home, "tmux.conf")
-	if err := state.WriteFile(conf, []byte(tmuxConf)); err != nil {
-		return nil, fmt.Errorf("tmux config: %w", err)
-	}
-	label := cmp.Or(os.Getenv("TOGO_TMUX_LABEL"), "togo")
-	userHome, _ := os.UserHomeDir()
-	bin := resolveTmux(state.LoginPath(ctx), TmuxFallbacks(userHome))
-	return &Service{
-		Tmux:     &tmux.Client{Bin: bin, Socket: []string{"-L", label}, Config: conf},
-		User:     &tmux.Client{Bin: bin},
-		Recent:   &state.Recent{File: filepath.Join(home, "recent.json")},
-		Manifest: &Manifest{Path: filepath.Join(home, "sessions.json")},
-		LockFile: filepath.Join(home, "run", "bib.lock"),
-		Shell:    cmp.Or(os.Getenv("SHELL"), "/bin/sh"),
-		Home:     userHome,
-	}, nil
-}
-
-// resolveTmux returns an absolute path to tmux, searching the absolute
-// directories of path and then fallbacks. The helper usually runs under a
-// bare ssh exec whose PATH lacks Homebrew and /usr/local, and the app runs
-// attach argv under that same PATH, so a bare "tmux" would not be found
-// there. When tmux is nowhere it returns "tmux", which fails as not
-// installed when run.
-func resolveTmux(path string, fallbacks []string) string {
-	var candidates []string
-	for _, dir := range filepath.SplitList(path) {
-		if filepath.IsAbs(dir) {
-			candidates = append(candidates, filepath.Join(dir, "tmux"))
-		}
-	}
-	for _, c := range append(candidates, fallbacks...) {
-		if p, err := exec.LookPath(c); err == nil {
-			return p
-		}
-	}
-	return "tmux"
+	mu       sync.Mutex
+	checked  bool
+	checkErr error
 }
 
 // List returns managed sessions ordered by bib, then unmanaged sessions
 // ordered by name.
 func (s *Service) List(ctx context.Context) ([]Session, error) {
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return nil, err
 	}
 	managed, err := s.listManaged(ctx)
@@ -207,17 +150,17 @@ func (s *Service) List(ctx context.Context) ([]Session, error) {
 }
 
 func (s *Service) listManaged(ctx context.Context) ([]Session, error) {
-	infos, err := s.Tmux.ListSessions(ctx)
+	recs, err := s.backend().List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
 	out := []Session{}
-	for _, info := range infos {
+	for _, r := range recs {
 		// Anything else on the togo socket was not made by Create, for
 		// example by someone running tmux -L togo by hand, and could not
 		// be described as a valid managed session.
-		if managedIDPattern.MatchString(info.Name) && validBib(info.Bib) {
-			out = append(out, s.withExit(s.withCommand(managedSession(info), info.Argv), info.Exit))
+		if managedIDPattern.MatchString(r.ID) && validBib(r.Values[optionBib]) {
+			out = append(out, s.withExit(s.withCommand(managedSession(r), r.Values[optionArgv]), r.Values[optionExit]))
 		}
 	}
 	slices.SortFunc(out, func(a, b Session) int { return strings.Compare(*a.Bib, *b.Bib) })
@@ -250,11 +193,11 @@ func (s *Service) Kill(ctx context.Context, id string) error {
 	if err := requireManaged(id); err != nil {
 		return err
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return err
 	}
-	err := s.Tmux.KillSession(ctx, id)
-	if err == nil || errors.Is(err, tmux.ErrNoSession) {
+	err := s.backend().Kill(ctx, id)
+	if err == nil || isNoSession(err) {
 		s.forget(id)
 	}
 	if err != nil {
@@ -276,10 +219,10 @@ func (s *Service) Rename(ctx context.Context, id, name string) (Session, error) 
 	if name == "" {
 		return Session{}, &InvalidParamsError{Msg: "name must not be empty"}
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return Session{}, err
 	}
-	if err := s.Tmux.SetOption(ctx, id, optionName, name); err != nil {
+	if err := s.backend().SetValue(ctx, id, optionName, name); err != nil {
 		return Session{}, notFoundOr(err, id)
 	}
 	sess, err := s.find(ctx, id)
@@ -295,14 +238,14 @@ func (s *Service) SetMuted(ctx context.Context, id string, muted bool) (Session,
 	if err := requireManaged(id); err != nil {
 		return Session{}, err
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return Session{}, err
 	}
 	value := "0"
 	if muted {
 		value = "1"
 	}
-	if err := s.Tmux.SetOption(ctx, id, optionMuted, value); err != nil {
+	if err := s.backend().SetValue(ctx, id, optionMuted, value); err != nil {
 		return Session{}, notFoundOr(err, id)
 	}
 	s.rememberMuted(id, muted)
@@ -335,7 +278,11 @@ func (s *Service) AttachCommand(ctx context.Context, id string) ([]string, error
 		return nil, err
 	}
 	if sess.Managed {
-		return s.Tmux.AttachArgv(sess.ID), nil
+		argv, err := s.backend().AttachArgv(ctx, sess.ID)
+		if err != nil {
+			return nil, notFoundOr(err, id)
+		}
+		return argv, nil
 	}
 	return s.User.AttachArgv(sess.Name), nil
 }
@@ -345,10 +292,10 @@ func (s *Service) AttachCommand(ctx context.Context, id string) ([]string, error
 // connected. Panes that already exist keep the environment they started with.
 const PhoneClientEnv = "TOGO_CLIENT"
 
-// PhoneAttachCommand is AttachCommand for the phone. A tmux attach command
+// PhoneAttachCommand is AttachCommand for the phone. An attach command
 // cannot carry an environment into the session's panes, so for a managed
-// session it first sets TOGO_CLIENT=1 in the session environment. The
-// user's own sessions are attached to unchanged.
+// session it first sets TOGO_CLIENT=1 in the session environment, where the
+// backend can. The user's own sessions are attached to unchanged.
 func (s *Service) PhoneAttachCommand(ctx context.Context, id string) ([]string, error) {
 	sess, err := s.find(ctx, id)
 	if err != nil {
@@ -357,13 +304,18 @@ func (s *Service) PhoneAttachCommand(ctx context.Context, id string) ([]string, 
 	if !sess.Managed {
 		return s.User.AttachArgv(sess.Name), nil
 	}
-	if err := s.Tmux.SetEnvironment(ctx, sess.ID, PhoneClientEnv, "1"); err != nil {
-		if errors.Is(err, tmux.ErrNoSession) {
+	b := s.backend()
+	if err := b.SetEnv(ctx, sess.ID, PhoneClientEnv, "1"); err != nil {
+		if isNoSession(err) {
 			return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
 		}
-		return nil, fmt.Errorf("tmux set-environment: %w", err)
+		return nil, fmt.Errorf("set environment: %w", err)
 	}
-	return s.Tmux.AttachArgv(sess.ID), nil
+	argv, err := b.AttachArgv(ctx, sess.ID)
+	if err != nil {
+		return nil, notFoundOr(err, id)
+	}
+	return argv, nil
 }
 
 // Resolve finds a session by id or by bib, written with or without the
@@ -377,7 +329,7 @@ func (s *Service) Resolve(ctx context.Context, bibOrID string) (Session, error) 
 		return Session{}, &InvalidParamsError{Msg: fmt.Sprintf("%q is not a session number or id", bibOrID)}
 	}
 	bib := fmt.Sprintf("%02d", n)
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return Session{}, err
 	}
 	sessions, err := s.listManaged(ctx)
@@ -399,7 +351,7 @@ func (s *Service) find(ctx context.Context, id string) (Session, error) {
 	if err != nil {
 		return Session{}, err
 	}
-	if err := s.checkTmux(ctx); err != nil {
+	if err := s.checkBackend(ctx); err != nil {
 		return Session{}, err
 	}
 	var sessions []Session
@@ -418,27 +370,25 @@ func (s *Service) find(ctx context.Context, id string) (Session, error) {
 	return Session{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 }
 
-// checkTmux verifies the tmux version once per Service. Results that will
-// not change while the helper runs (missing, too old, supported) are cached;
-// other failures, such as a cancelled context, are retried next call.
-func (s *Service) checkTmux(ctx context.Context) error {
+// checkBackend checks the backend can run sessions, which for tmux is its
+// version. Answers the backend calls stable (for tmux: missing, too old,
+// supported) are kept for the life of the Service; others, such as a
+// cancelled context, are asked again next call.
+func (s *Service) checkBackend(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.tmuxChecked {
-		return s.tmuxErr
+	if s.checked {
+		return s.checkErr
 	}
-	major, minor, raw, err := s.Tmux.Version(ctx)
-	switch {
-	case errors.Is(err, tmux.ErrNotInstalled):
-		s.tmuxErr = &TmuxUnavailableError{}
-	case err != nil && raw == "":
-		return fmt.Errorf("tmux version: %w", err)
-	case err != nil || major < requiredMajor || major == requiredMajor && minor < requiredMinor:
-		s.tmuxErr = &TmuxUnavailableError{Found: strings.TrimPrefix(raw, "tmux ")}
+	stable, err := s.backend().Check(ctx)
+	if !stable {
+		return err
 	}
-	s.tmuxChecked = true
-	return s.tmuxErr
+	s.checked, s.checkErr = true, err
+	return err
 }
+
+func trimTmux(raw string) string { return strings.TrimPrefix(raw, "tmux ") }
 
 func (s *Service) newID() string {
 	if s.NewID != nil {
@@ -472,29 +422,33 @@ func requireManaged(id string) error {
 }
 
 func notFoundOr(err error, id string) error {
-	if errors.Is(err, tmux.ErrNoSession) {
+	if isNoSession(err) {
 		return fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 	return fmt.Errorf("session %s: %w", id, err)
 }
 
-func managedSession(info tmux.SessionInfo) Session {
-	created := info.Created.UTC()
-	if t, err := time.Parse(time.RFC3339, info.CreatedTag); err == nil {
+func managedSession(r Record) Session {
+	created := r.Created.UTC()
+	if t, err := time.Parse(time.RFC3339, r.Values[optionCreated]); err == nil {
 		created = t.UTC()
 	}
-	bib := info.Bib
+	bib := r.Values[optionBib]
+	st := statusIdle
+	if r.Dead {
+		st = statusExited
+	}
 	return Session{
-		ID:              info.Name,
+		ID:              r.ID,
 		Bib:             &bib,
-		Name:            info.Title,
-		Agent:           info.Agent,
-		Cwd:             info.Path,
+		Name:            r.Values[optionName],
+		Agent:           r.Values[optionAgent],
+		Cwd:             r.Path,
 		CreatedAt:       created,
-		Status:          status(info),
-		AttachedClients: info.Attached,
+		Status:          st,
+		AttachedClients: r.Attached,
 		Managed:         true,
-		Muted:           info.Muted,
+		Muted:           r.Values[optionMuted] == "1",
 	}
 }
 

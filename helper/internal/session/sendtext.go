@@ -3,6 +3,7 @@ package session
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -78,15 +79,20 @@ func (s *Service) SendText(ctx context.Context, id, text string, submit bool, st
 	if sess.Status == statusExited {
 		return &ReplyRefusedError{Reason: wire.ConflictEnded}
 	}
-	target := "=" + id + ":"
-	cmd, err := s.Tmux.PaneCommand(ctx, target)
+	b := s.backend()
+	shell, err := b.ShellInForeground(ctx, id)
 	if err != nil {
 		return notFoundOr(err, id)
 	}
-	if isShell(cmd, s.shell()) {
+	if shell {
 		return &ReplyRefusedError{Reason: wire.ConflictEnded}
 	}
-	if err := typeReply(ctx, s.Tmux, id, text, submit, sleepCtx); err != nil {
+	if err := b.Reply(ctx, id, text, submit); err != nil {
+		var refused *ReplyRefusedError
+		var invalid *InvalidParamsError
+		if errors.As(err, &refused) || errors.As(err, &invalid) {
+			return err
+		}
 		return notFoundOr(err, id)
 	}
 	return nil
